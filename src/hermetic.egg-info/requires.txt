@@ -1,6 +1,0 @@
-
-[dev]
-pytest>=7
-
-[fakefs]
-pyfakefs>=5
