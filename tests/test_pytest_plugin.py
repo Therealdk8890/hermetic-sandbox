@@ -91,7 +91,8 @@ def test_record_keeps_journal_only_for_failures(pytester):
     result.assert_outcomes(passed=1, failed=1)
     journals = [p for p in record_dir.iterdir() if p.name != "index.json"]
     assert len(journals) == 1
-    assert "test_fails" in journals[0].name
+    assert journals[0].name.startswith("journal-")
+    assert "test_fails" not in journals[0].name
     assert not journals[0].name.startswith(".pending-")
     index = json.loads((record_dir / "index.json").read_text())
     assert index["journals"][0]["test"].endswith("::test_fails")
@@ -123,7 +124,25 @@ def test_record_failure_prints_replay_command(pytester):
     )
     record_dir = pytester.path / "journals"
     result = pytester.runpytest(f"--hermetic-record={record_dir}")
-    result.stdout.fnmatch_lines(["*--hermetic-replay=*"])
+    result.stdout.fnmatch_lines(["*python -m hermetic replay*--test*"])
+
+
+def test_credential_shaped_nodeid_suppresses_hermetic_replay_command(pytester):
+    pytester.makepyfile(
+        """
+        import pytest
+
+        @pytest.mark.hermetic
+        @pytest.mark.parametrize("value", [1], ids=["ghp_" + "A" * 36])
+        def test_fails(value):
+            assert False
+        """
+    )
+    result = pytester.runpytest(
+        f"--hermetic-record={pytester.path / 'journals'}"
+    )
+    result.assert_outcomes(failed=1)
+    result.stdout.fnmatch_lines(["*replay command omitted*credential*"])
 
 
 def test_replay_reproduces_recorded_failure(pytester):
@@ -217,7 +236,9 @@ def test_retry_does_not_delete_failure_journal(pytester):
     result.assert_outcomes(passed=1, failed=1)
     kept = [p.name for p in record_dir.iterdir() if p.name != "index.json"]
     assert len(kept) == 1
-    assert "attempt" in kept[0] or "test_flaky" in kept[0]
+    assert kept[0].startswith("journal-")
+    assert "attempt" not in kept[0]
+    assert "test_flaky" not in kept[0]
 
 
 def test_hermetic_all_repro_command_includes_the_flag(pytester):
@@ -246,7 +267,7 @@ def test_fixture_only_test_is_recorded(pytester):
     result.assert_outcomes(failed=1)
     journals = [p for p in record_dir.iterdir() if p.name != "index.json"]
     assert len(journals) == 1
-    result.stdout.fnmatch_lines(["*--hermetic-replay=*"])
+    result.stdout.fnmatch_lines(["*python -m hermetic replay*--test*"])
 
 
 def test_off_marker_wins_over_fixture_request(pytester):

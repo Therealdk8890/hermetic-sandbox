@@ -4,11 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hermetic-sandbox"
-version = "0.1.0"
+version = "0.2.0"
 description = "One context manager that freezes time, seeds all randomness, isolates the filesystem, and blocks network — keyed to a single replayable seed, with record/replay of nondeterminism from failing runs"
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "MIT" }
+license = "MIT"
 authors = [{ name = "Danny Kissel" }]
 keywords = [
     "testing",
@@ -24,7 +24,6 @@ classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
     "Framework :: Pytest",
-    "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
@@ -38,7 +37,11 @@ classifiers = [
 
 [project.optional-dependencies]
 fakefs = ["pyfakefs>=5"]
-dev = ["pytest>=7"]
+secure = ["cryptography>=43"]
+dev = ["pytest>=7", "cryptography>=43"]
+
+[project.scripts]
+hermetic = "hermetic.cli:main"
 
 [project.entry-points.pytest11]
 hermetic = "hermetic.pytest_plugin"

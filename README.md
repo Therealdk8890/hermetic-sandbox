@@ -20,23 +20,28 @@ feed the exact same values back into the test on your laptop:
 
 ```bash
 # CI
-pytest --hermetic-all --hermetic-record=journals/     # upload journals/ on failure
+PYTHONHASHSEED=0 pytest --hermetic-all \
+  --hermetic-record=.hermetic-journals/
 
 # your machine, after downloading the artifact
-pytest 'tests/test_checkout.py::test_flaky' --hermetic-replay=journals/tests-test_checkout...json.gz
+hermetic replay .hermetic-journals/
 ```
 
 A flaky test stops being folklore ("it fails sometimes on CI??") and becomes a
 file you can re-run.
 
-Zero dependencies. Python 3.10+. MIT. **Not a security boundary** — code inside
-the sandbox can trivially escape via C extensions or subprocesses; this is a
-determinism tool for tests, nothing more.
+Zero dependencies in the core. Python 3.10+. MIT. Client-side journal encryption
+is an optional extra. **Not a security boundary** — code inside the sandbox can
+trivially escape via C extensions or subprocesses; this is a determinism tool
+for tests, nothing more.
 
 ## Install
 
 ```bash
 pip install hermetic-sandbox
+
+# Needed only to encrypt CI journals before upload:
+pip install 'hermetic-sandbox[secure]'
 ```
 
 (The distribution is named `hermetic-sandbox` on PyPI; the import is plain
@@ -102,39 +107,92 @@ parallelism. Failing sandboxed tests print a copy-pasteable repro command.
 
 ### The CI record/replay loop
 
-1. CI runs `pytest --hermetic-all --hermetic-record=journals/`.
-2. Every sandboxed test records real values as it runs. Journals for **failing
-   attempts are kept** (a later passing retry from a rerun plugin never deletes
-   them); passing tests leave nothing. `journals/index.json` maps files to tests.
-3. Upload `journals/` as a CI artifact when the job fails.
-4. Locally: `pytest --hermetic-replay=path/to/journal.json.gz`. The plugin
-   selects the recorded test automatically and feeds back the recorded clock
-   readings, urandom draws, and `random` state. The journal's recorded
-   configuration wins over local options, and replay warns loudly about
-   anything that makes it less than faithful (different Python/TZ/locale/
-   PYTHONHASHSEED, multi-threaded recording, event-cap overflow).
+1. CI runs
+   `PYTHONHASHSEED=0 pytest --hermetic-all --hermetic-record=.hermetic-journals/`.
+2. One sandbox spans fixture setup, the test call, and fixture teardown.
+   Journals for **failing attempts are kept**; passing tests leave nothing.
+   Files have opaque names and mode `0600` on POSIX. On Windows, raw journals,
+   indexes, sealed journals, and decrypted replay paths use a protected DACL
+   with exactly one full-control entry for the current user, and fail closed if
+   that postcondition cannot be verified.
+3. Before any upload, run
+   `hermetic journal inspect .hermetic-journals/<journal>.json.gz`. The command
+   fails closed for malformed data, credential-shaped metadata, unsafe
+   permissions, or replay-sensitive plaintext.
+4. Sensitive journals must be encrypted locally:
 
-Set `PYTHONHASHSEED` explicitly in CI — dict/set-iteration-order flakes can't
-be replayed without it, and the repro hint includes it when set.
+   ```bash
+   # HERMETIC_JOURNAL_KEY is a URL-safe-base64 encoding of exactly 32 random bytes.
+   hermetic journal seal .hermetic-journals/ \
+     --output .hermetic-sealed-journals/
+   ```
 
-### What's in a journal (read before uploading anywhere public)
+   Upload only `.hermetic-sealed-journals/`, with short retention. Keep the key
+   in a CI secret and your team password manager; it is removed from the pytest
+   subprocess environment during replay.
+5. After download, one command selects the recorded test, restores its
+   `PYTHONHASHSEED`, decrypts into a private temporary file when needed, and
+   removes that file afterward:
+
+   ```bash
+   gh run download RUN_ID --name hermetic-journals \
+     --dir .hermetic-sealed-journals/
+   hermetic replay .hermetic-sealed-journals/
+   ```
+
+Strict replay verifies the global order of captured events, rejects missing or
+extra events, compares the final global `random` state, and refuses event-cap,
+cross-thread, Python, hash-seed, source, test-file, Hermetic, and pytest
+mismatches. Platform and locale differences remain explicit warnings because
+captured Python-level inputs can still replay across them. Use
+`strict_replay=False` only for exploratory best-effort replay.
+
+Set `PYTHONHASHSEED` explicitly in CI — dict/set-iteration-order flakes cannot
+be replayed without it. The `hermetic replay` command restores the recorded
+value before launching pytest.
+
+### Journal security
 
 Clock readings, **verbatim urandom draws** (any token/key the test derived from
-them is recoverable), the `random` state, environment variable **names only** —
-except the values of `TZ` and `PYTHONHASHSEED` (and the locale string), which
-the fingerprint stores for replay-fidelity warnings — plus hostname, platform,
-and git SHA. Treat journals like logs:
-private artifact storage, short retention (7–14 days is plenty — a journal is
-only useful until the flake is fixed).
+them is recoverable), the initial and final global `random` state, the pytest
+node id, configuration, and a minimal replay fingerprint. Environment names,
+environment values, and the hostname are not stored; `TZ`, `PYTHONHASHSEED`,
+locale, platform, source hashes, and versions are retained for fidelity checks.
+
+Raw journals are credential-equivalent. Hermetic does not pretend that
+redacting entropy preserves exact replay. Instead it uses private atomic files,
+value-free credential reports, a fail-closed upload audit, and optional
+AES-256-GCM client-side encryption. Never upload the raw journal directory to a
+public or plaintext artifact store. Decrypted replay files live only in a
+mode-`0700` POSIX temporary directory with mode-`0600` files, or in Windows
+paths protected by a current-user-only DACL. They are removed after pytest
+exits.
+
+The repository's
+[`Cross-runner replay proof`](https://github.com/Therealdk8890/hermetic-sandbox/blob/main/.github/workflows/replay-proof.yml) records a
+known-safe synthetic Linux failure, seals its replay-sensitive journal, and
+requires fresh Linux, macOS, and Windows jobs to reproduce its clock, random,
+UUID, and `secrets` values in under 60 seconds measured from immediately before
+artifact download. Its checked-in key is explicitly public canary material;
+production keys must be secret and independently generated. The precise claim,
+evidence, and non-claims are maintained in
+[`REPLAY_PROOF.md`](https://github.com/Therealdk8890/hermetic-sandbox/blob/main/REPLAY_PROOF.md).
 
 ## Honest limitations
 
+- **Captured-input boundary**: journals capture Python-level clock calls, global
+  `random` state, and Python-level `os.urandom`/`secrets` draws. They do not
+  capture ambient environment values, existing file contents, local socket
+  responses, subprocess behavior, dependency behavior, or C-extension inputs.
+  Exact replay is guaranteed only for the captured inputs in a compatible
+  source/runtime environment. Native cross-OS replay is tested for that scope,
+  not claimed for arbitrary platform-dependent tests.
 - **Threads**: patches are process-global; the virtual clock affects all
   threads, but `threading.Event.wait`/`Condition.wait`/lock timeouts block in C
   against the *real* clock and can't be virtualized. A thread that calls the
   patched (non-blocking) `sleep` in a loop will busy-spin. Multi-threaded
-  recording is detected and stamped in the journal; replay warns.
-- **asyncio**: virtual time is not supported in v0.1. `loop.time()` does follow
+  recording is detected and stamped in the journal; strict replay refuses it.
+- **asyncio**: virtual time is not supported. `loop.time()` does follow
   the patched `time.monotonic`, but the event loop blocks in
   `selector.select()` in C — `await asyncio.sleep(n)` under a frozen clock
   hangs. Use `clock="off"` for async tests that await sleeps/timeouts.
@@ -150,6 +208,9 @@ only useful until the flake is fixed).
   recording made with a network allowlist replays with a warning that those
   calls are uncaptured.
 - **Subprocesses** inherit nothing: patches live in this interpreter.
+- **Abrupt termination**: a hard process kill cannot flush a pending journal.
+  Ordinary setup/call/teardown failures and best-effort session cleanup are
+  covered.
 
 ## Recipes
 

@@ -214,15 +214,20 @@ class ReplayTimeSource(TimeSource):
         fallback: VirtualTimeSource,
         strict: bool,
         on_fallback: Callable[[str], None],
+        on_event: Callable[[str], None] | None = None,
     ) -> None:
         self._queues = {name: iter(values) for name, values in queues.items()}
+        self._totals = {name: len(values) for name, values in queues.items()}
         self._consumed: dict[str, int] = {}
         self._fallback = fallback
         self._strict = strict
         self._on_fallback = on_fallback  # warns (once per source) on fallback
+        self._on_event = on_event
         self._lock = threading.Lock()
 
     def _next(self, source: str, fallback_value: Callable[[], float]) -> float:
+        if self._on_event is not None:
+            self._on_event(source)
         with self._lock:
             it = self._queues.get(source)
             if it is not None:
@@ -237,6 +242,22 @@ class ReplayTimeSource(TimeSource):
             raise ReplayExhausted(source, self._consumed.get(source, 0))
         self._on_fallback(source)
         return fallback_value()
+
+    def assert_consumed(self) -> None:
+        """Fail strict replay when recorded clock events were skipped."""
+        if not self._strict:
+            return
+        leftovers = {
+            source: total - self._consumed.get(source, 0)
+            for source, total in self._totals.items()
+            if total != self._consumed.get(source, 0)
+        }
+        if leftovers:
+            raise ReplayExhausted(
+                "unconsumed clock events "
+                + ", ".join(f"{source}={count}" for source, count in sorted(leftovers.items())),
+                sum(self._consumed.values()),
+            )
 
     def wall(self) -> float:
         return self._next("time.time", self._fallback.wall)

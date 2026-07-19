@@ -1,0 +1,65 @@
+name: Cross-runner replay proof
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Public, synthetic canary material only. Production users must supply a secret,
+# independently generated key.
+env:
+  HERMETIC_JOURNAL_KEY: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+
+jobs:
+  record:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - name: Install the checkout
+        run: python -m pip install ".[dev]"
+      - name: Record and audit a synthetic failure
+        run: python .github/replay-proof/record.py
+      - name: Upload only the audited, sealed proof journal
+        uses: actions/upload-artifact@v7
+        with:
+          name: hermetic-replay-proof
+          path: .hermetic-proof/
+          include-hidden-files: true
+          retention-days: 1
+          if-no-files-found: error
+
+  replay:
+    needs: record
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - name: Install the checkout
+        run: python -m pip install ".[dev]"
+      - name: Start failed-check-to-replay timer
+        shell: python
+        run: |
+          import os
+          import time
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as stream:
+              print(f"HERMETIC_HANDOFF_STARTED={time.time()}", file=stream)
+      - name: Download the journal from the Linux recording job
+        uses: actions/download-artifact@v8
+        with:
+          name: hermetic-replay-proof
+          path: .hermetic-proof/download
+      - name: Prove download-to-exact-replay in under one minute
+        run: python .github/replay-proof/verify.py .hermetic-proof/download

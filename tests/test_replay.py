@@ -13,8 +13,14 @@ import uuid
 import pytest
 
 import hermetic
+import hermetic._journal as journal_module
 from hermetic import ReplayExhausted, ReplayMismatch
-from hermetic._journal import JournalReader, JournalWriter, collect_fingerprint
+from hermetic._journal import (
+    JournalReader,
+    JournalWriter,
+    collect_fingerprint,
+    write_private_json,
+)
 
 
 def _observable():
@@ -100,14 +106,14 @@ def test_journal_is_gzip_when_gz_suffix(tmp_path):
     assert data["format"] == "hermetic-journal"
 
 
-def test_journal_records_names_not_env_values(tmp_path):
+def test_journal_records_neither_env_names_nor_values(tmp_path):
     os.environ["HERMETIC_JOURNAL_SECRET"] = "do-not-leak"
     try:
         journal = tmp_path / "run.json"
         with hermetic.sandbox(record=journal):
             pass
         text = journal.read_text()
-        assert "HERMETIC_JOURNAL_SECRET" in text
+        assert "HERMETIC_JOURNAL_SECRET" not in text
         assert "do-not-leak" not in text
     finally:
         os.environ.pop("HERMETIC_JOURNAL_SECRET", None)
@@ -119,6 +125,34 @@ def test_journal_no_partial_files_left(tmp_path):
         time.time()
     leftovers = [p for p in tmp_path.iterdir() if p.name != "run.json"]
     assert leftovers == []
+
+
+@pytest.mark.parametrize("kind", ["journal", "index"])
+def test_windows_journal_and_index_writes_enforce_current_user_acl(
+    kind, tmp_path, monkeypatch
+):
+    destination = tmp_path / (
+        "journal.json.gz" if kind == "journal" else "index.json"
+    )
+    enforced = []
+
+    def enforce(path):
+        enforced.append((path, path.stat().st_size))
+        return path
+
+    monkeypatch.setattr(journal_module, "_IS_WINDOWS", True)
+    monkeypatch.setattr(journal_module, "ensure_private_path", enforce)
+    if kind == "journal":
+        JournalWriter(destination, config={}).write()
+    else:
+        write_private_json(destination, {"journals": []})
+
+    assert len(enforced) == 2
+    temporary, published = enforced
+    assert temporary[0] != destination
+    assert temporary[1] == 0
+    assert published[0] == destination
+    assert published[1] > 0
 
 
 def test_journal_counts_and_random_state(tmp_path):
@@ -163,6 +197,23 @@ def test_wrong_format_raises_replay_mismatch(tmp_path):
     bad.write_text('{"format": "something-else"}')
     with pytest.raises(ReplayMismatch):
         JournalReader.load(bad)
+
+
+def test_unsupported_version_error_does_not_render_metadata(tmp_path):
+    secret_shaped_version = "sk-proj-" + ("A" * 32)
+    bad = tmp_path / "unsupported.json"
+    bad.write_text(
+        json.dumps(
+            {
+                "format": "hermetic-journal",
+                "version": secret_shaped_version,
+            }
+        )
+    )
+    with pytest.raises(ReplayMismatch) as failure:
+        JournalReader.load(bad)
+    assert "unsupported journal version" in str(failure.value)
+    assert secret_shaped_version not in str(failure.value)
 
 
 def test_fingerprint_mismatch_warnings():
