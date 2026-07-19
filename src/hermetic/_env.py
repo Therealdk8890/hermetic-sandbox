@@ -12,8 +12,9 @@ from ._patch import PatchSet
 _SCRUB_KEEP = {
     "PATH", "HOME", "TMPDIR", "TEMP", "TMP", "LANG", "LC_ALL", "LC_CTYPE",
     "TZ", "TERM", "SHELL", "USER", "PYTHONHASHSEED", "VIRTUAL_ENV",
+    "PYTEST_CURRENT_TEST", "PYTEST_XDIST_WORKER", "PYTEST_XDIST_WORKER_COUNT",
+    "PYTEST_XDIST_TESTRUNUID",
 }
-_SCRUB_KEEP_PREFIXES = ("PYTEST_", "PYTHON", "COV_CORE_", "HERMETIC_")
 
 
 def install_env_patches(
@@ -35,7 +36,7 @@ def install_env_patches(
 
     if scrub:
         for key in list(os.environ):
-            if key in _SCRUB_KEEP or key.startswith(_SCRUB_KEEP_PREFIXES):
+            if key in _SCRUB_KEEP or key.startswith("LC_"):
                 continue
             del os.environ[key]
 

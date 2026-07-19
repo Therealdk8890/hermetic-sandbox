@@ -196,3 +196,22 @@ def test_hostname_starting_with_127_is_not_loopback():
             assert not isinstance(excinfo.value, NetworkBlockedError)
         finally:
             sock.close()
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        "https://user:password@example.com",
+        "user@example.com",
+        "example.com/path",
+        "example.com:0",
+        "example.com:65536",
+        "example.com:not-a-port",
+        "bad host.example",
+        "example.com\ninternal",
+    ],
+)
+def test_allowlist_rejects_credentialed_or_malformed_entries_without_echo(entry):
+    with pytest.raises(hermetic.SandboxError) as excinfo:
+        hermetic.sandbox(seed=1, rng="seed", network=[entry]).__enter__()
+    assert entry not in str(excinfo.value)

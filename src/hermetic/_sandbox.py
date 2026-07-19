@@ -27,7 +27,7 @@ import time as _time_module
 import uuid as _uuid_module
 import warnings
 from pathlib import Path
-from typing import Any, Callable, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping, cast
 
 from . import _datetimes
 from ._clock import (
@@ -47,14 +47,15 @@ from ._clock import (
     parse_start_time,
 )
 from ._env import install_env_patches
-from ._errors import SandboxActiveError, SandboxError
+from ._errors import ReplayError, ReplayMismatch, SandboxActiveError, SandboxError
 from ._fs import FsIsolation, install_fs_patches
-from ._journal import JournalReader, JournalWriter
+from ._journal import JournalReader, JournalWriter, ReplaySequence
 from ._net import NetworkPolicy, install_network_patches
 from ._patch import PatchSet
 from ._random import (
     REAL_OS_URANDOM,
     DeterministicEntropy,
+    EntropySource,
     RecordingEntropy,
     ReplayEntropy,
     derive_seed,
@@ -132,6 +133,9 @@ class _EnterState:
         self.patches = PatchSet()
         self.handle: SandboxHandle | None = None
         self.writer: JournalWriter | None = None
+        self.reader: JournalReader | None = None
+        self.capture_random_after = False
+        self.replay_validators: list[Callable[[], None]] = []
 
 
 class Sandbox:
@@ -165,7 +169,7 @@ class Sandbox:
             raise SandboxError(f"rng must be 'all', 'seed' or 'off', not {rng!r}")
         if fs == "fake":
             raise SandboxError(
-                "fs='fake' is not part of hermetic v0.1 — compose pyfakefs with "
+                "fs='fake' is not part of hermetic — compose pyfakefs with "
                 "fs='off' instead (see README)"
             )
         if fs not in ("off", "isolate"):
@@ -225,12 +229,31 @@ class Sandbox:
         reader: JournalReader | None = None
         replay_warnings: list[str] = []
         if mode == "replay":
+            from ._security import inspect_journal
+
+            security = inspect_journal(self.replay, current_env=os.environ)  # type: ignore[arg-type]
+            if not security.valid:
+                raise ReplayMismatch(
+                    "hermetic: journal schema validation failed; run "
+                    "'hermetic journal inspect' for a value-free report"
+                )
+            if security.has_credentials:
+                raise ReplayMismatch(
+                    "hermetic: journal metadata may contain a credential; "
+                    "replay was refused before rendering metadata"
+                )
             reader = JournalReader.load(self.replay)  # type: ignore[arg-type]
+            state.reader = reader
             replay_warnings = reader.faithfulness_warnings()
             _warn_on_test_mismatch(reader, replay_warnings)
-            config = dict(reader.config)
+            if self.strict_replay and reader.strict_blockers():
+                raise ReplayMismatch(
+                    "hermetic: strict replay refused an unfaithful journal: "
+                    + "; ".join(reader.strict_blockers())
+                )
+            config: dict[str, Any] = dict(reader.config)
         else:
-            config = None  # set below for record
+            config = {}  # replaced below for record
 
         # Effective settings: replay uses the journal's recorded configuration
         # for everything that shapes the recorded code path.
@@ -245,10 +268,12 @@ class Sandbox:
             allow_loopback = config.get("allow_loopback", self.allow_loopback)
             allow_unix = config.get("allow_unix", self.allow_unix)
             scrub_env = config.get("scrub_env", self.scrub_env)
+            deep_datetime = config.get("deep_datetime", self.deep_datetime)
+            spin_limit = config.get("spin_limit", self.spin_limit)
             # Journal seed first (keyed the recorded run's fallbacks), then the
             # caller's, then a fresh one — so strict_replay=False fallbacks are
             # reproducible whenever any seed is known.
-            seed = config.get("seed")
+            seed = cast(int | None, config.get("seed"))
             if seed is None:
                 seed = self.seed
             if seed is None:
@@ -264,6 +289,8 @@ class Sandbox:
             allow_loopback = self.allow_loopback
             allow_unix = self.allow_unix
             scrub_env = self.scrub_env
+            deep_datetime = self.deep_datetime
+            spin_limit = self.spin_limit
             seed = self.seed
             if seed is None and mode == "deterministic":
                 seed = entropy_seed() & 0xFFFFFFFF
@@ -294,6 +321,8 @@ class Sandbox:
                 "fs": fs_mode,
                 "chdir": chdir,
                 "scrub_env": scrub_env,
+                "deep_datetime": deep_datetime,
+                "spin_limit": spin_limit,
                 # The caller's seed (the pytest plugin always derives one) keys
                 # replay fallbacks; record mode itself determinizes nothing.
                 "seed": seed,
@@ -315,11 +344,21 @@ class Sandbox:
             isolation = install_fs_patches(patches, chdir=chdir)
 
         # 3. Randomness.
-        entropy = None
-        state_for_global = None
-        seed_for_global = None
+        entropy: EntropySource | None = None
+        state_for_global: tuple | None = None
+        seed_for_global: int | None = None
+        sequence: ReplaySequence | None = None
+        if reader is not None:
+            sequence = ReplaySequence(
+                reader.sequence,
+                strict=self.strict_replay,
+                on_fallback=_fallback_warner(),
+            )
+            if reader.sequence is not None:
+                state.replay_validators.append(sequence.assert_consumed)
         if rng_mode != "off":
             if mode == "deterministic":
+                assert seed is not None
                 seed_for_global = seed
                 if rng_mode == "all":
                     entropy = DeterministicEntropy(derive_seed(seed, "urandom"))
@@ -329,19 +368,37 @@ class Sandbox:
                 state.writer.set_random_state(
                     serialize_random_state(_random_module.getstate())
                 )
+                state.capture_random_after = True
                 snapshot_and_restore_random_state(patches)
                 if rng_mode == "all":
                     entropy = RecordingEntropy(state.writer.record_event)
             else:  # replay
+                assert reader is not None
+                assert seed is not None
                 if reader.random_state is not None:
                     state_for_global = deserialize_random_state(reader.random_state)
                 if rng_mode == "all":
-                    entropy = ReplayEntropy(
+                    replay_entropy = ReplayEntropy(
                         list(reader.events.get("urandom", [])),
                         DeterministicEntropy(derive_seed(seed, "urandom")),
                         self.strict_replay,
                         _fallback_warner(),
+                        sequence.consume if sequence is not None else None,
                     )
+                    entropy = replay_entropy
+                    state.replay_validators.append(replay_entropy.assert_consumed)
+                if reader.random_state_after is not None:
+                    expected_random_state = reader.random_state_after
+
+                    def validate_random_state() -> None:
+                        observed = serialize_random_state(_random_module.getstate())
+                        if observed != expected_random_state:
+                            raise ReplayMismatch(
+                                "hermetic: replay ended with a different global "
+                                "random state; the random call path diverged"
+                            )
+
+                    state.replay_validators.append(validate_random_state)
             install_rng_patches(
                 patches, rng_mode, entropy, seed_for_global, state_for_global
             )
@@ -350,22 +407,25 @@ class Sandbox:
         source: TimeSource | None = None
         if clock_mode == "virtual":
             if mode == "deterministic":
-                source = VirtualTimeSource(now_epoch, tick, self.spin_limit)
+                source = VirtualTimeSource(now_epoch, tick, spin_limit)
             elif mode == "record":
                 assert state.writer is not None
                 source = RecordingTimeSource(state.writer.record_event)
             else:
+                assert reader is not None
                 source = ReplayTimeSource(
                     {
                         name: list(reader.events.get(name, []))
                         for name in ("time.time", "time.monotonic", "time.perf_counter")
                     },
-                    VirtualTimeSource(now_epoch, tick, self.spin_limit),
+                    VirtualTimeSource(now_epoch, tick, spin_limit),
                     self.strict_replay,
                     _fallback_warner(),
+                    sequence.consume if sequence is not None else None,
                 )
+                state.replay_validators.append(source.assert_consumed)
             install_time_patches(patches, source)
-            _datetimes.install_datetime_patches(patches, self.deep_datetime)
+            _datetimes.install_datetime_patches(patches, deep_datetime)
             _datetimes.set_active_source(patches, source)
 
         # 5. Network.
@@ -389,6 +449,17 @@ class Sandbox:
         state = self._state
         if state is None:
             raise SandboxError("sandbox exited without being entered")
+        validation_error: BaseException | None = None
+        if state.capture_random_after and state.writer is not None:
+            state.writer.set_random_state_after(
+                serialize_random_state(_random_module.getstate())
+            )
+        for validate in state.replay_validators:
+            try:
+                validate()
+            except BaseException as exc:  # noqa: BLE001 - surfaced after cleanup
+                validation_error = exc
+                break
         write_error: BaseException | None = None
         if state.writer is not None:
             try:
@@ -418,6 +489,11 @@ class Sandbox:
             warnings.warn(
                 f"hermetic: failed to write journal: {write_error}", stacklevel=2
             )
+        if (
+            validation_error is not None
+            and not (exc_type is not None and issubclass(exc_type, ReplayError))
+        ):
+            raise validation_error
 
     # -- decorator --
 

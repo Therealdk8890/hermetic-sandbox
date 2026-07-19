@@ -25,15 +25,15 @@ from __future__ import annotations
 
 import hashlib
 import os
-import re
 import shlex
+import warnings
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from ._errors import SandboxError
-from ._journal import JournalReader
+from ._journal import JournalReader, write_private_json
 from ._random import entropy_seed
 from ._sandbox import Sandbox, current
 
@@ -43,11 +43,6 @@ _STASH_STATE = "_hermetic_state"
 def _derive_item_seed(base: int, nodeid: str) -> int:
     digest = hashlib.sha256(nodeid.encode()).digest()
     return int.from_bytes(digest[:8], "big") ^ base
-
-
-def _slug(nodeid: str, max_length: int = 80) -> str:
-    text = re.sub(r"[^A-Za-z0-9_.-]+", "-", nodeid).strip("-")
-    return text[:max_length] or "test"
 
 
 class _PluginState:
@@ -65,6 +60,7 @@ class _PluginState:
             config.getoption("hermetic_all") or config.getini("hermetic_all")
         )
         record_dir = config.getoption("hermetic_record")
+        self.record_arg = str(record_dir) if record_dir else None
         self.record_dir = Path(record_dir).resolve() if record_dir else None
         replay_path = config.getoption("hermetic_replay")
         self.replay_path = Path(replay_path).resolve() if replay_path else None
@@ -88,6 +84,16 @@ class _PluginState:
         self.kept: list[dict[str, Any]] = []
         # nodeid -> effective seed, for repro hints
         self.seeds: dict[str, int] = {}
+        # A sandbox entered before fixture setup and exited after fixture teardown.
+        self.active: dict[str, Sandbox] = {}
+        # The first setup/call exception, passed to Sandbox.__exit__ so teardown
+        # failures in hermetic itself do not mask the test's original failure.
+        self.phase_exc: dict[
+            str, tuple[type[BaseException], BaseException, Any]
+        ] = {}
+        # Marker/config validation historically failed in the call phase. Keep
+        # that public pytest outcome while moving valid sandboxes into setup.
+        self.deferred_call_errors: dict[str, SandboxError] = {}
 
 
 def _state(config: pytest.Config) -> _PluginState:
@@ -173,6 +179,13 @@ def pytest_collection_modifyitems(
             "--hermetic-replay: the journal does not name a test; select exactly "
             f"one test on the command line ({len(items)} collected)"
         )
+    for item in items:
+        marker = item.get_closest_marker("hermetic")
+        if marker is not None and marker.kwargs.get("off", False):
+            raise pytest.UsageError(
+                f"--hermetic-replay: {item.nodeid!r} is marked "
+                "hermetic(off=True); a replay cannot opt out of the sandbox"
+            )
 
 
 def _resolve_kwargs(item: pytest.Item, *, for_fixture: bool) -> dict[str, Any] | None:
@@ -195,6 +208,11 @@ def _resolve_kwargs(item: pytest.Item, *, for_fixture: bool) -> dict[str, Any] |
         )
     kwargs = dict(marker.kwargs)
     if kwargs.pop("off", False):
+        if state.replay_reader is not None:
+            raise pytest.UsageError(
+                f"--hermetic-replay: {item.nodeid!r} is marked "
+                "hermetic(off=True); a replay cannot opt out of the sandbox"
+            )
         return None
     for reserved in ("record", "replay", "test_id"):
         if reserved in kwargs:
@@ -224,11 +242,8 @@ def _build_sandbox(item: pytest.Item, *, for_fixture: bool = False) -> Sandbox |
     elif state.record_dir is not None:
         attempt = state.attempts.get(item.nodeid, 0) + 1
         state.attempts[item.nodeid] = attempt
-        name = (
-            f".pending-{_slug(item.nodeid)}"
-            f"__{hashlib.sha1(item.nodeid.encode()).hexdigest()[:10]}"
-            f"__a{attempt}.json.gz"
-        )
+        digest = hashlib.sha256(item.nodeid.encode()).hexdigest()[:16]
+        name = f".pending-journal-{digest}-a{attempt}.json.gz"
         record = state.record_dir / name
         state.pending[item.nodeid] = (record, attempt)
         state.attempt_failed[item.nodeid] = False
@@ -245,28 +260,96 @@ def _requests_fixture(item: pytest.Item) -> bool:
     return "hermetic_sandbox" in getattr(item, "fixturenames", ())
 
 
-@pytest.hookimpl(wrapper=True)
-def pytest_runtest_call(item: pytest.Item):
-    # The fixture enters the sandbox when requested; otherwise wrap the call.
-    if _requests_fixture(item) or current() is not None:
-        return (yield)
-    box = _build_sandbox(item)
+@pytest.hookimpl(tryfirst=True)
+def pytest_runtest_setup(item: pytest.Item) -> None:
+    """Enter before pytest starts fixture setup.
+
+    Using the setup/teardown hooks instead of wrapping only ``pytest_runtest_call``
+    keeps one event stream across fixture setup, the test body, and fixture
+    teardown. It also creates a fresh sandbox for each protocol attempt, which
+    is important for rerun plugins.
+    """
+    state = _state(item.config)
+    if current() is not None:
+        # Preserve the prior behavior for callers that deliberately run pytest
+        # while an application-owned sandbox is already active.
+        return
+    if item.nodeid in state.active:
+        raise SandboxError(
+            f"hermetic: sandbox state for {item.nodeid!r} leaked from a prior attempt"
+        )
+    state.phase_exc.pop(item.nodeid, None)
+    try:
+        box = _build_sandbox(item, for_fixture=_requests_fixture(item))
+    except SandboxError as exc:
+        state.deferred_call_errors[item.nodeid] = exc
+        return
     if box is None:
-        return (yield)
-    with box:
-        return (yield)
+        return
+    box.__enter__()
+    state.active[item.nodeid] = box
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_runtest_call(item: pytest.Item) -> None:
+    deferred = _state(item.config).deferred_call_errors.pop(item.nodeid, None)
+    if deferred is not None:
+        raise deferred
+
+
+@pytest.hookimpl(wrapper=True, tryfirst=True)
+def pytest_runtest_teardown(item: pytest.Item, nextitem: pytest.Item | None):
+    """Exit after every fixture and teardown hook has finished."""
+    state = _state(item.config)
+    box = state.active.get(item.nodeid)
+    teardown_failed = False
+    try:
+        try:
+            result = yield
+        except BaseException as exc:
+            teardown_failed = not isinstance(exc, pytest.skip.Exception)
+            if box is not None:
+                # Sandbox.__exit__ suppresses its own cleanup/write errors when
+                # a test error already exists, preserving the teardown failure.
+                box.__exit__(type(exc), exc, exc.__traceback__)
+            raise
+        else:
+            if box is not None:
+                prior = state.phase_exc.get(item.nodeid)
+                try:
+                    if prior is None:
+                        box.__exit__(None, None, None)
+                    else:
+                        box.__exit__(*prior)
+                except BaseException:
+                    teardown_failed = True
+                    raise
+            return result
+    finally:
+        state.active.pop(item.nodeid, None)
+        if teardown_failed and item.nodeid in state.attempt_failed:
+            state.attempt_failed[item.nodeid] = True
+        # The writer exits above (or in the fallback fixture during ``yield``).
+        # Only now may a pending path be renamed or deleted.
+        if item.nodeid in state.pending:
+            _finalize_pending(state, item.nodeid)
+        state.phase_exc.pop(item.nodeid, None)
+        state.deferred_call_errors.pop(item.nodeid, None)
 
 
 @pytest.fixture
 def hermetic_sandbox(request: pytest.FixtureRequest):
     """The active hermetic sandbox handle for this test.
 
-    With ``@pytest.mark.hermetic`` (or ``--hermetic-all``) this enters the
-    marker-configured sandbox; without one it enters a default sandbox (with
-    full plugin bookkeeping: record journals, repro commands). Either way the
-    sandbox spans fixture setup through teardown. A test marked
-    ``hermetic(off=True)`` is honored: the fixture yields ``None``.
+    The runtest lifecycle hook normally enters the marker-configured sandbox
+    before fixture setup, so this fixture only exposes that existing handle.
+    The fallback keeps direct/nonstandard fixture execution usable. A test
+    marked ``hermetic(off=True)`` is honored outside replay and receives None.
     """
+    handle = current()
+    if handle is not None:
+        yield handle
+        return
     box = _build_sandbox(request.node, for_fixture=True)
     if box is None:
         yield None
@@ -279,11 +362,15 @@ def hermetic_sandbox(request: pytest.FixtureRequest):
 def pytest_runtest_makereport(item: pytest.Item, call: pytest.CallInfo):
     report = yield
     state = _state(item.config)
+    if call.excinfo is not None and report.when != "teardown":
+        state.phase_exc[item.nodeid] = (
+            call.excinfo.type,
+            call.excinfo.value,
+            call.excinfo.tb,
+        )
     if item.nodeid in state.pending:
         if report.failed:
             state.attempt_failed[item.nodeid] = True
-        if report.when == "teardown":
-            _finalize_pending(state, item.nodeid)
     return report
 
 
@@ -325,8 +412,6 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config) -> None:
         "error", []
     )
     lines: list[str] = []
-    hashseed = os.environ.get("PYTHONHASHSEED")
-    prefix = f"PYTHONHASHSEED={hashseed} " if hashseed else ""
     all_flag = " --hermetic-all" if state.all_tests else ""
     journal_by_test: dict[str, dict[str, Any]] = {}
     for entry in state.kept:
@@ -337,13 +422,23 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config) -> None:
         nodeid = report.nodeid
         if nodeid in journal_by_test and state.record_dir is not None:
             journal = state.record_dir / journal_by_test[nodeid]["file"]
-            lines.append(
-                f"{prefix}pytest {shlex.quote(nodeid)} "
-                f"--hermetic-replay={shlex.quote(str(journal))}"
-            )
+            from ._security import inspect_journal
+
+            security = inspect_journal(journal, current_env=os.environ)
+            if security.has_credentials:
+                lines.append(
+                    "hermetic: replay command omitted because journal metadata "
+                    "may contain a credential"
+                )
+            else:
+                lines.append(
+                    "python -m hermetic replay "
+                    f"{shlex.quote(state.record_arg or str(state.record_dir))} "
+                    f"--test {shlex.quote(nodeid)}"
+                )
         elif nodeid in state.seeds and state.replay_reader is None:
             lines.append(
-                f"{prefix}pytest {shlex.quote(nodeid)}{all_flag} "
+                f"pytest {shlex.quote(nodeid)}{all_flag} "
                 f"--hermetic-seed={state.base_seed}"
             )
     if lines:
@@ -352,8 +447,32 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config) -> None:
             terminalreporter.line(line)
 
 
+@pytest.hookimpl(tryfirst=True)
 def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
     state = _state(session.config)
+    # A reraised interruption can bypass pytest_runtest_teardown. Restore the
+    # process and keep any journal that was successfully written.
+    for nodeid, box in list(state.active.items()):
+        interrupted = RuntimeError(
+            f"pytest session ended before hermetic teardown completed for {nodeid!r}"
+        )
+        if nodeid in state.attempt_failed:
+            state.attempt_failed[nodeid] = True
+        try:
+            box.__exit__(RuntimeError, interrupted, None)
+        except BaseException as exc:  # noqa: BLE001 - session cleanup must continue
+            warnings.warn(
+                f"hermetic: failed to close interrupted sandbox for {nodeid!r}: {exc}",
+                stacklevel=2,
+            )
+        finally:
+            state.active.pop(nodeid, None)
+    for nodeid in list(state.pending):
+        state.attempt_failed[nodeid] = True
+        _finalize_pending(state, nodeid)
+        state.phase_exc.pop(nodeid, None)
+        state.deferred_call_errors.pop(nodeid, None)
+
     if getattr(session.config, "workerinput", None) is not None:
         # xdist worker: ship repro bookkeeping to the master.
         workeroutput = getattr(session.config, "workeroutput", None)
@@ -375,7 +494,5 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
             continue
         entries.append({"file": path.name, "test": reader.test})
     if entries:
-        import json
-
         index = state.record_dir / "index.json"
-        index.write_text(json.dumps({"journals": entries}, indent=2))
+        write_private_json(index, {"journals": entries})

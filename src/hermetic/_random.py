@@ -76,14 +76,19 @@ class ReplayEntropy(EntropySource):
         fallback: DeterministicEntropy,
         strict: bool,
         on_fallback: Callable[[str], None],
+        on_event: Callable[[str], None] | None = None,
     ) -> None:
         self._values = iter(values)
+        self._total = len(values)
         self._consumed = 0
         self._fallback = fallback
         self._strict = strict
         self._on_fallback = on_fallback
+        self._on_event = on_event
 
     def bytes(self, n: int) -> bytes:
+        if self._on_event is not None:
+            self._on_event("urandom")
         try:
             recorded = bytes.fromhex(next(self._values))
         except StopIteration:
@@ -102,6 +107,14 @@ class ReplayEntropy(EntropySource):
             self._on_fallback("urandom")
             return self._fallback.bytes(n)
         return recorded
+
+    def assert_consumed(self) -> None:
+        """Fail strict replay when recorded entropy draws were skipped."""
+        if self._strict and self._consumed != self._total:
+            raise ReplayMismatch(
+                "hermetic: replay ended before consuming all recorded urandom "
+                f"draws ({self._total - self._consumed} remain)"
+            )
 
 
 def snapshot_and_restore_random_state(patches: PatchSet) -> tuple:

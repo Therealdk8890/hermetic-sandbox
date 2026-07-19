@@ -6,3 +6,5 @@ build/
 dist/
 .coverage*
 .hermetic-journals/
+.hermetic-sealed-journals/
+.hermetic-proof/

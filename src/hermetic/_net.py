@@ -25,7 +25,7 @@ import socket as _socket_module
 import threading
 from typing import Iterable
 
-from ._errors import NetworkBlockedError
+from ._errors import NetworkBlockedError, SandboxError
 from ._patch import PatchSet
 
 REAL_CONNECT = _socket_module.socket.connect
@@ -38,12 +38,13 @@ _LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1"}
 
 def _normalize_host(host: object) -> str:
     if isinstance(host, bytes):
+        raw_host = host
         # The idna codec only supports strict error handling; fall back to a
         # lossy ascii decode for inputs it rejects (IP literals, raw bytes).
         try:
-            host = host.decode("idna")
+            host = raw_host.decode("idna")
         except UnicodeError:
-            host = host.decode("ascii", errors="replace")
+            host = raw_host.decode("ascii", errors="replace")
     text = str(host).strip().lower().strip("[]")
     return text
 
@@ -79,19 +80,52 @@ class NetworkPolicy:
     def allow(self, entry: str) -> None:
         """Add ``"host"`` or ``"host:port"`` to the allowlist at runtime."""
         text = str(entry).strip().lower()
+        if (
+            not text
+            or any(ord(char) < 32 or char.isspace() for char in text)
+            or "://" in text
+            or any(char in text for char in ("@", "/", "?", "#"))
+        ):
+            raise SandboxError(
+                "hermetic: invalid network allowlist entry; expected a hostname, "
+                "IP address, host:port, or [IPv6]:port"
+            )
         port: int | None = None
         host = text
         # IPv6 literals use [addr]:port; bare IPv6 has multiple colons.
         if text.startswith("["):
             host, _, rest = text.partition("]")
+            if not _ or not host:
+                raise SandboxError(
+                    "hermetic: invalid network allowlist entry; expected [IPv6]:port"
+                )
             host = host.lstrip("[")
             if rest.startswith(":"):
-                port = int(rest[1:])
+                port = _parse_port(rest[1:])
+            elif rest:
+                raise SandboxError(
+                    "hermetic: invalid network allowlist entry; unexpected text "
+                    "after the IPv6 literal"
+                )
         elif text.count(":") == 1:
             host, _, port_text = text.partition(":")
-            port = int(port_text)
+            port = _parse_port(port_text)
+        elif text.count(":") > 1:
+            try:
+                ipaddress.IPv6Address(text)
+            except ValueError as exc:
+                raise SandboxError(
+                    "hermetic: invalid network allowlist entry; bracket an IPv6 "
+                    "literal when specifying a port"
+                ) from exc
+        normalized = _normalize_host(host)
+        if not normalized or not _valid_host(normalized):
+            raise SandboxError(
+                "hermetic: invalid network allowlist host; expected a hostname "
+                "or IP address"
+            )
         with self._lock:
-            self._entries.add((_normalize_host(host), port))
+            self._entries.add((normalized, port))
 
     def _entry_allows(self, host: str, port: int | None) -> bool:
         return ((host, None) in self._entries
@@ -119,6 +153,38 @@ class NetworkPolicy:
                     ip = _normalize_host(sockaddr[0])
                     self._resolved_ips.setdefault(ip, set()).add(port)
 
+
+def _parse_port(text: str) -> int:
+    try:
+        port = int(text)
+    except (TypeError, ValueError) as exc:
+        raise SandboxError(
+            "hermetic: invalid network allowlist port; expected 1 through 65535"
+        ) from exc
+    if not 1 <= port <= 65535:
+        raise SandboxError(
+            "hermetic: invalid network allowlist port; expected 1 through 65535"
+        )
+    return port
+
+
+def _valid_host(host: str) -> bool:
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        pass
+    if len(host) > 253:
+        return False
+    labels = host.rstrip(".").split(".")
+    return all(
+        label
+        and len(label) <= 63
+        and label[0].isalnum()
+        and label[-1].isalnum()
+        and all(char.isalnum() or char in "-_" for char in label)
+        for label in labels
+    )
 
 def _address_endpoint(address: object) -> tuple[object, int | None] | None:
     """Extract (host, port) from a sockaddr; None means "not an inet address"."""

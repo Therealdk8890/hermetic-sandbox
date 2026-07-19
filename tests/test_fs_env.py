@@ -67,7 +67,7 @@ def test_scrub_env_keeps_essentials_drops_rest():
     os.environ["HERMETIC_SUPER_SECRET"] = "hunter2"
     try:
         with hermetic.sandbox(seed=1, scrub_env=True):
-            assert "HERMETIC_SUPER_SECRET" in os.environ  # HERMETIC_ prefix kept
+            assert "HERMETIC_SUPER_SECRET" not in os.environ
             os.environ["TOTALLY_CUSTOM_VAR"] = "x"
         with hermetic.sandbox(seed=1, scrub_env=True, env={"HERMETIC_SUPER_SECRET": None}):
             assert "HERMETIC_SUPER_SECRET" not in os.environ
