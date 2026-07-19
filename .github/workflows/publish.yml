@@ -47,3 +47,6 @@ jobs:
           name: dist
           path: dist/
       - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          # Retagging must not fail on an already-published version.
+          skip-existing: true
