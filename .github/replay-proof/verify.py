@@ -45,6 +45,8 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit(
             f"replay proof expected the recorded failure, got exit {result.returncode}"
         )
+    if not actual_path.is_file():
+        raise SystemExit("replay proof did not execute the recorded test")
     expected = json.loads(expected_path.read_text())
     actual = json.loads(actual_path.read_text())
     if actual != expected:

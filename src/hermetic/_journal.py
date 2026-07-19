@@ -90,7 +90,12 @@ def _test_file_sha(test_id: str | None, cwd: str) -> str | None:
     if not candidate.is_absolute():
         candidate = Path(cwd) / candidate
     try:
-        return hashlib.sha256(candidate.read_bytes()).hexdigest()
+        source = candidate.read_bytes()
+        # Git may materialize the same Python source as LF or CRLF depending on
+        # checkout policy. Python's universal-newline parser treats those files
+        # identically, so the replay fingerprint should too.
+        source = source.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+        return hashlib.sha256(source).hexdigest()
     except OSError:
         return None
 

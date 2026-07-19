@@ -226,6 +226,21 @@ def test_fingerprint_mismatch_warnings():
     assert any("Python version" in message for message in messages)
 
 
+def test_test_file_fingerprint_normalizes_checkout_line_endings(tmp_path):
+    lf = tmp_path / "lf.py"
+    crlf = tmp_path / "crlf.py"
+    lf.write_bytes(b"def test_example():\n    assert True\n")
+    crlf.write_bytes(b"def test_example():\r\n    assert True\r\n")
+
+    assert journal_module._test_file_sha(  # type: ignore[attr-defined]
+        f"{lf}::test_example",
+        str(tmp_path),
+    ) == journal_module._test_file_sha(  # type: ignore[attr-defined]
+        f"{crlf}::test_example",
+        str(tmp_path),
+    )
+
+
 def test_clock_control_works_in_record_mode_and_replays(tmp_path):
     journal = tmp_path / "run.json"
     with hermetic.sandbox(record=journal) as sb:

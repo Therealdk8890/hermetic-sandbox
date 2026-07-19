@@ -13,6 +13,7 @@ permissions:
 # independently generated key.
 env:
   HERMETIC_JOURNAL_KEY: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+  TZ: UTC
 
 jobs:
   record:
