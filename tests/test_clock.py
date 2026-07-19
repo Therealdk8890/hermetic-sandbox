@@ -49,6 +49,12 @@ def test_time_ns_variants_are_ints():
         assert time.time_ns() == pytest.approx(time.time() * 1e9, rel=1e-9)
 
 
+needs_tzset = pytest.mark.skipif(
+    not hasattr(time, "tzset"), reason="time.tzset is POSIX-only"
+)
+
+
+@needs_tzset
 def test_localtime_family_uses_virtual_time():
     with hermetic.sandbox(seed=1, now="2020-06-15T12:00:00+00:00", env={"TZ": "UTC"}):
         time.tzset()
@@ -121,6 +127,7 @@ def test_datetime_arithmetic_stays_usable():
         assert isinstance(later, datetime.datetime)
 
 
+@needs_tzset
 def test_deep_datetime_scan_rewrites_from_imports():
     module = types.ModuleType("fake_user_module_for_hermetic_test")
     module.datetime = datetime.datetime

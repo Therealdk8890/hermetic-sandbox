@@ -102,6 +102,12 @@ def _short_unix_path() -> str:
     return tempfile.mktemp(prefix="hermetic-", suffix=".sock", dir="/tmp")
 
 
+needs_af_unix = pytest.mark.skipif(
+    not hasattr(socket, "AF_UNIX"), reason="AF_UNIX not available on this platform"
+)
+
+
+@needs_af_unix
 def test_unix_sockets_allowed_by_default():
     path = _short_unix_path()
     with hermetic.sandbox(seed=1):
@@ -119,6 +125,7 @@ def test_unix_sockets_allowed_by_default():
             os.unlink(path)
 
 
+@needs_af_unix
 def test_unix_sockets_blocked_when_disallowed():
     path = _short_unix_path()
     with hermetic.sandbox(seed=1, allow_unix=False):
