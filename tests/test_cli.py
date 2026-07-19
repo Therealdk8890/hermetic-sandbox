@@ -111,7 +111,7 @@ def test_replay_from_relocated_directory_uses_portable_path_and_hash_seed(
     assert command[3].startswith("--hermetic-replay=")
     replay_path = Path(command[3].split("=", 1)[1])
     assert replay_path == downloaded / "nested" / "failure.json.gz"
-    assert "runner" not in str(replay_path)
+    assert not replay_path.is_relative_to(runner_artifact)
     assert "tests/test_checkout.py::test_flaky" in command
     assert command[-2:] == ["-q", "--maxfail=1"]
     assert environment["PYTHONHASHSEED"] == "8675309"
@@ -344,7 +344,7 @@ def test_python_module_cli_replays_after_artifact_directory_relocation(tmp_path)
     assert completed.returncode == 1
     assert "replayed failure" in completed.stdout
     assert "from failure.json.gz" in completed.stderr
-    assert "runner" not in completed.stderr
+    assert str(journal) not in completed.stderr
 
 
 def test_journal_seal_encrypts_sensitive_replay_data_with_private_output(
@@ -766,7 +766,7 @@ def test_replay_sealed_directory_uses_private_temp_and_removes_key(
     assert status == 6
     assert not observed["decrypted"].exists()
     message = capsys.readouterr().err
-    assert "nested/failure.any-extension" in message
+    assert str(Path("nested") / "failure.any-extension") in message
     assert "hermetic-replay-" not in message
     assert key_value not in message
 
