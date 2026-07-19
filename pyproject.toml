@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hermetic"
+version = "0.1.0"
+description = "One context manager that freezes time, seeds all randomness, isolates the filesystem, and blocks network — keyed to a single replayable seed, with record/replay of nondeterminism from failing runs"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Danny Kissel" }]
+keywords = [
+    "testing",
+    "flaky-tests",
+    "determinism",
+    "hermetic",
+    "freeze-time",
+    "record-replay",
+    "pytest",
+    "reproducibility",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Framework :: Pytest",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Testing",
+    "Topic :: Software Development :: Libraries",
+    "Typing :: Typed",
+]
+
+[project.optional-dependencies]
+fakefs = ["pyfakefs>=5"]
+dev = ["pytest>=7"]
+
+[project.entry-points.pytest11]
+hermetic = "hermetic.pytest_plugin"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+hermetic = ["py.typed"]
