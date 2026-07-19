@@ -22,8 +22,8 @@ jobs:
       # journals hermetic records carry a knowable seed (see README).
       PYTHONHASHSEED: "0"
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python }}
       - name: Install
