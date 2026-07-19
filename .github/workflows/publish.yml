@@ -37,7 +37,7 @@ jobs:
     runs-on: ubuntu-latest
     environment:
       name: pypi
-      url: https://pypi.org/project/hermetic/
+      url: https://pypi.org/project/hermetic-sandbox/
     permissions:
       # Trusted publishing: PyPI trusts this workflow's OIDC token, no API keys.
       id-token: write

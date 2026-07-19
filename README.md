@@ -36,8 +36,11 @@ determinism tool for tests, nothing more.
 ## Install
 
 ```bash
-pip install hermetic
+pip install hermetic-sandbox
 ```
+
+(The distribution is named `hermetic-sandbox` on PyPI; the import is plain
+`import hermetic`.)
 
 The pytest plugin activates automatically (it does nothing until you use a
 marker, fixture, or `--hermetic-*` option).

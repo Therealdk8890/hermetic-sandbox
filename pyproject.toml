@@ -3,7 +3,7 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "hermetic"
+name = "hermetic-sandbox"
 version = "0.1.0"
 description = "One context manager that freezes time, seeds all randomness, isolates the filesystem, and blocks network — keyed to a single replayable seed, with record/replay of nondeterminism from failing runs"
 readme = "README.md"
