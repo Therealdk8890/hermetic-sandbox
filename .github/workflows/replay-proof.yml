@@ -19,16 +19,18 @@ jobs:
   record:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          python-version: "3.13"
+          persist-credentials: false
+      - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
+        with:
+          python-version: "3.13.15"
       - name: Install the checkout
         run: python -m pip install ".[dev]"
       - name: Record and audit a synthetic failure
         run: python .github/replay-proof/record.py
       - name: Upload only the audited, sealed proof journal
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
           name: hermetic-replay-proof
           path: .hermetic-proof/
@@ -44,10 +46,12 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          python-version: "3.13"
+          persist-credentials: false
+      - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
+        with:
+          python-version: "3.13.15"
       - name: Install the checkout
         run: python -m pip install ".[dev]"
       - name: Start failed-check-to-replay timer
@@ -58,7 +62,7 @@ jobs:
           with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as stream:
               print(f"HERMETIC_HANDOFF_STARTED={time.time()}", file=stream)
       - name: Download the journal from the Linux recording job
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
         with:
           name: hermetic-replay-proof
           path: .hermetic-proof/download
